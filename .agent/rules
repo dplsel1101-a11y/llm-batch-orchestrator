@@ -1,0 +1,9 @@
+# Project: Vertex AI Batch Orchestrator
+# Constraints: High Reliability, Strict JSONL, GCP Native
+
+1. **NO MARKDOWN IN JSON**: When generating JSON or JSONL strings inside Python code, NEVER wrap them in ```json ... ```. Use raw strings or `json.dumps`.
+2. **STRICT TYPING**: All Python functions must have type hints. Use `pydantic` for all data models.
+3. **ERROR HANDLING**: Every GCS and Vertex AI call must be wrapped in `try/except` blocks with specific logging.
+4. **CONCURRENCY**: Respect `MAX_CONCURRENT_JOBS`. Never spawn infinite loops in `scheduler.py`.
+5. **GEMINI COMPATIBILITY**: The model ID is strictly `gemini-3-flash-preview`. Do not hallucinate other model versions.
+6. **CLEAN OUTPUT**: The `pipeline_logic.py` must include a regex cleaner to strip Markdown from Vertex AI responses before parsing.

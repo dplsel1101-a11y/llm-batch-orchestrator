@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+.env
+.venv
+env/
+venv/
+.git
+.gitignore
+local_jobs.db
+gcp-key.json
+secrets/
+.vscode/
