@@ -1,0 +1,21 @@
+services:
+  vertex-proxy:
+    container_name: vertex-proxy
+    image: dplsel/llm-orchestrator:v5
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - ACTIVE_KEY_GROUP=002
+      - HTTPS_PROXY=socks5://14a37c338c192:d0aa22d916@198.3.29.19:12324
+      - BUCKET_NAME=llm-batch-data-yunqingzhangcheng
+    volumes:
+      - ./json:/app/json
+      - ./data:/app/data
+    networks:
+      - dify_net
+
+networks:
+  dify_net:
+    external: true
+    name: docker_default
