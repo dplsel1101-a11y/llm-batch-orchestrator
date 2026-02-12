@@ -1,31 +1,21 @@
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from typing import Optional
 from sqlalchemy.orm import Session
 from core.models import init_db, SessionLocal, BatchJob
-from services.gcs_handler import GCSHandler
-from services.vertex_handler import VertexHandler
-from services.pipeline_logic import PipelineLogic
+from services.dispatcher import dispatcher
 from scheduler import start_scheduler
 from config.logging_config import setup_logging
-from config.settings import settings
 from config.manager import config_manager
-from api.admin import router as admin_router
+from config.settings import settings
 import uuid
 import logging
+import time
 
-# 初始化
 setup_logging()
 logger = logging.getLogger("main")
-app = FastAPI(title="Vertex AI Batch Orchestrator")
+app = FastAPI(title="Headless Batch Orchestrator")
 
-# Mount Static Files (Admin UI)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Include Routers
-app.include_router(admin_router)
-
-# 依赖注入
+# Deps
 def get_db():
     db = SessionLocal()
     try:
@@ -35,81 +25,96 @@ def get_db():
 
 @app.on_event("startup")
 def startup_event():
-    logger.info("Starting up... Initializing DB and Scheduler")
-    init_db()
+    logger.info("Initializing Headless Orchestrator...")
+    init_db() # Ensure tables exist
     
-    # 尝试加载上次活跃的配置（如果有）
-    try:
-        config_manager.reload_context()
-    except Exception as e:
-        logger.warning(f"Could not load active project context on startup: {e}")
-        
+    # keys are already loaded by ConfigManager __init__ but we can force log
+    logger.info(f"Active Project Pool Size: {len(config_manager.project_pool)}")
+    
     start_scheduler()
-
-@app.get("/admin", include_in_schema=False)
-async def admin_page():
-    return FileResponse("static/admin.html")
 
 @app.get("/health")
 def health_check():
-    """ECS 健康检查"""
-    return {"status": "ok", "service": "batch-orchestrator"}
+    return {
+        "status": "ok", 
+        "pool_size": len(config_manager.project_pool),
+        "cooldown": time.time() < dispatcher.cooldown_until
+    }
+
+from pydantic import BaseModel
+
+class ChatRequest(BaseModel):
+    query: str
+    # Dify might send 'inputs', 'query', or 'messages'. 
+    # Adjust based on Dify spec or generic 'prompt'.
+    sys_prompt: Optional[str] = None
+    model: str = settings.MODEL_ID
+    use_search: bool = True
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 0.95
+    top_k: Optional[int] = 40
+    thinking_level: Optional[str] = None
+
+@app.post("/chat")
+def chat_endpoint(request: ChatRequest):
+    if not config_manager.initialized:
+        # Should be initialized by startup_event, but just in case
+        config_manager.load_projects()
+
+    if not config_manager.project_pool:
+        logger.error("No projects available for chat.")
+        raise HTTPException(status_code=503, detail="No active projects available.")
+    
+    try:
+        response_text = dispatcher.dispatch_chat(
+            prompt=request.query,
+            model_id=request.model,
+            sys_prompt=request.sys_prompt,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k,
+            thinking_level=request.thinking_level,
+            use_search=request.use_search,
+        )
+        return response_text
+        
+    except Exception as e:
+        logger.error(f"Chat Error: All projects failed chat. Last error: {e}")
+        raise HTTPException(status_code=503, detail=f"All projects failed chat. Last error: {e}")
 
 @app.post("/api/submit")
 def submit_job(request: dict, db: Session = Depends(get_db)):
-    """提交新任务"""
+    """Async Job Submission via Dispatcher"""
+    # 1. Init Record
     job_uuid = str(uuid.uuid4())
-    logger.info(f"Received submission: {job_uuid}")
-    
-    # 1. 创建 DB 记录
     new_job = BatchJob(
-        job_uuid=job_uuid,
-        current_stage=0,
+        id=job_uuid, # Schema changed from job_uuid to id
         status="PENDING",
-        gcs_prefix=f"{job_uuid}/"
     )
     db.add(new_job)
     db.commit()
     
+    # 2. Dispatch
     try:
-        # 2. 准备 Stage 1
-        gcs = GCSHandler()
-        # 构造带有 custom_id 的输入
-        input_data = [PipelineLogic.build_input_for_stage(1, original_request={**request, "id": job_uuid})]
-        input_uri = gcs.upload_jsonl(input_data, f"{job_uuid}/stage_1/input.jsonl")
-        
-        # 3. 提交 Vertex Job
-        vertex = VertexHandler()
-        job_name = f"stage-1-{job_uuid}"
-        vertex_job_id = vertex.submit_job(job_name, input_uri, f"{job_uuid}/stage_1/output/")
-        
-        # 4. 更新状态
-        new_job.vertex_job_name = vertex_job_id
-        new_job.current_stage = 1
-        new_job.status = "RUNNING"
-        db.commit()
-        
-        return {"job_uuid": job_uuid, "status": "STARTED"}
-        
+        result = dispatcher.submit_job(job_uuid, request, db)
+        return result
     except Exception as e:
-        logger.error(f"Submission failed: {e}")
-        new_job.status = "FAILED"
-        new_job.last_error = str(e)
-        db.commit()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Dispatch Error: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
 
-@app.get("/api/jobs/{job_uuid}")
-def get_job_status(job_uuid: str, db: Session = Depends(get_db)):
-    """查询状态"""
-    job = db.query(BatchJob).filter(BatchJob.job_uuid == job_uuid).first()
+@app.get("/api/jobs/{job_id}")
+def get_job_status(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(BatchJob).filter(BatchJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    status = str(job.status)
     
     return {
-        "job_uuid": job.job_uuid,
-        "status": job.status,
-        "current_stage": job.current_stage,
-        "last_error": job.last_error,
-        "updated_at": job.updated_at,
-        "result_uri": f"gs://{settings.BUCKET_NAME}/{job.job_uuid}/stage_7/output/" if job.status == "COMPLETED" else None
+        "job_id": job.id,
+        "status": status,
+        "project": job.used_project_id,
+        "vertex_job_id": job.vertex_job_id,
+        "result_uri": job.output_gcs_uri if status == "SUCCEEDED" else None,
+        "error": job.result_summary or ""
     }
+

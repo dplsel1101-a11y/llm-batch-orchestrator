@@ -1,6 +1,6 @@
 fastapi==0.109.0
 uvicorn==0.27.0
-google-cloud-aiplatform>=1.38.0
+google-cloud-aiplatform>=1.43.0
 google-cloud-storage>=2.14.0
 sqlalchemy==2.0.25
 pydantic==2.6.0
@@ -8,5 +8,6 @@ pydantic-settings==2.1.0
 apscheduler==3.10.4
 python-dotenv==1.0.0
 requests==2.31.0
+pysocks==1.7.1 # Required for SOCKS proxy
 python-multipart==0.0.9
 # mysql-connector-python==8.3.0 # Uncomment for production

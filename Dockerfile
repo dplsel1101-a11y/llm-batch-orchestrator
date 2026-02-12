@@ -1,16 +1,16 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
 # 1. Install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 
 # 2. Copy code
 COPY . .
 
-# 3. Create secrets directory (for mounting key)
-RUN mkdir -p /app/secrets
+# 3. Create secrets and data directories
+RUN mkdir -p /app/secrets /app/data && chmod 777 /app/data
 
 # 4. Default Environment Variables (Overridden by ECS)
 ENV PORT=8000

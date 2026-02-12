@@ -1,112 +1,150 @@
 import os
-import logging
 import json
+import glob
+import random
+from typing import List, Dict, Optional
 from google.oauth2 import service_account
-from google.cloud import storage, aiplatform
-from core.models import SessionLocal, Project, GoogleAccount
+from google.cloud import storage
 from config.settings import settings
+import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("config.manager")
 
 class ConfigManager:
+    """
+    Headless Config Manager.
+    Loads Service Account Keys from `json/{ACTIVE_KEY_GROUP}/` directory.
+    Manages Global Proxy.
+    """
     _instance = None
-    _active_project = None
-    _storage_client = None
-    _aiplatform_initialized = False
-
+    
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(ConfigManager, cls).__new__(cls)
+            cls._instance.initialized = False
         return cls._instance
 
-    def get_active_project(self):
-        """获取当前活跃项目配置，如果缓存为空则从 DB 加载"""
-        if self._active_project:
-            return self._active_project
+    def __init__(self):
+        if self.initialized:
+            return
+            
+        self.project_pool: List[Dict] = []
+        self.project_map: Dict[str, Dict] = {}
+        self._storage_clients: Dict[str, storage.Client] = {}
+        self.apply_proxy()
+        self.load_projects()
+        self.initialized = True
 
-        db = SessionLocal()
-        try:
-            project = db.query(Project).filter(Project.is_active == True).first()
-            if project:
-                # 预加载 account 以获取代理
-                account = db.query(GoogleAccount).filter(GoogleAccount.id == project.google_account_id).first()
-                self._active_project = {
-                    "id": project.id,
-                    "project_id": project.project_id,
-                    "credentials_json": project.credentials_json,
-                    "bucket_name": project.bucket_name,
-                    "region": project.region,
-                    "proxy_url": account.proxy_url if account else None
-                }
-                logger.info(f"Loaded active project: {project.project_name} ({project.project_id})")
-                return self._active_project
-            else:
-                logger.warning("No active project found in database.")
-                return None
-        finally:
-            db.close()
+    def apply_proxy(self):
+        """Apply HTTPS_PROXY from settings to environment variables."""
+        if settings.HTTPS_PROXY:
+            logger.info(f"Applying Global Proxy: {settings.HTTPS_PROXY}")
+            os.environ["https_proxy"] = settings.HTTPS_PROXY
+            os.environ["http_proxy"] = settings.HTTPS_PROXY
+            os.environ["HTTPS_PROXY"] = settings.HTTPS_PROXY
+            os.environ["HTTP_PROXY"] = settings.HTTPS_PROXY
+        else:
+            logger.info("No Proxy Configured (Direct Connect).")
 
-    def apply_proxy_settings(self):
-        """应用代理设置到环境变量"""
-        project_config = self.get_active_project()
-        if not project_config:
+    def load_projects(self):
+        """Scan json/{ACTIVE_KEY_GROUP} for .json key files."""
+        self.project_pool = []
+        self.project_map = {}
+        self._storage_clients = {}
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # Adjust path to match docker layout or local
+        # Assuming /app/json inside docker, or ./json locally
+        key_dir = os.path.join(base_dir, "json", settings.ACTIVE_KEY_GROUP)
+        
+        logger.info(f"Scanning for keys in: {key_dir}")
+        
+        if not os.path.exists(key_dir):
+            logger.warning(f"Key directory not found: {key_dir} (This is expected during build/test if keys aren't mounted yet)")
             return
 
-        proxy_url = project_config.get("proxy_url")
-        if proxy_url:
-            logger.info(f"Applying Proxy: {proxy_url}")
-            os.environ["HTTPS_PROXY"] = proxy_url
-            os.environ["HTTP_PROXY"] = proxy_url
-            # gRPC 特有配置
-            os.environ["GRPC_DNS_RESOLVER"] = "native"
-            # os.environ["GRPC_PROXY_EXP"] = proxy_url # 注意：gRPC 代理支持可能需要特定库版本
-        else:
-            logger.info("No proxy configured for active account.")
-            os.environ.pop("HTTPS_PROXY", None)
-            os.environ.pop("HTTP_PROXY", None)
-
-    def get_credentials(self):
-        """从 JSON 内容构建凭证对象"""
-        config = self.get_active_project()
-        if not config:
-            raise ValueError("No active project configured")
+        key_files = glob.glob(os.path.join(key_dir, "*.json"))
+        logger.info(f"Found {len(key_files)} key files.")
         
-        info = json.loads(config["credentials_json"])
-        return service_account.Credentials.from_service_account_info(info)
+        for key_path in key_files:
+            try:
+                with open(key_path, 'r') as f:
+                    key_data = json.load(f)
+                
+                project_id = key_data.get("project_id")
+                if not project_id:
+                    logger.warning(f"File {key_path} is missing 'project_id', skipping.")
+                    continue
 
-    def get_storage_client(self):
-        """获取配置好的 Storage Client"""
-        # 注意：Storage Client 通常不重用，或者需要小心处理。这里每次创建新的以确保凭证最新
-        # 如果有性能问题再考虑缓存
-        creds = self.get_credentials()
-        project_id = self.get_active_project()["project_id"]
-        return storage.Client(credentials=creds, project=project_id)
+                # Filter AI Studio Keys (gen-lang-client) as per user request
+                if "gen-lang-client" in str(project_id):
+                    logger.info(f"Skipping AI Studio Key: {project_id}")
+                    continue
+                
+                credentials = service_account.Credentials.from_service_account_info(
+                    key_data,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+                
+                project_context = {
+                    "project_id": project_id,
+                    "credentials": credentials,
+                    "key_path": key_path,
+                    "region": settings.REGION
+                }
+                self.project_pool.append(project_context)
+                self.project_map[project_id] = project_context
+                logger.info(f"Loaded Project: {project_id}")
+                
+            except Exception as e:
+                logger.error(f"Failed to load key {key_path}: {e}")
 
-    def init_aiplatform(self):
-        """初始化 Vertex AI"""
-        config = self.get_active_project()
-        if not config:
-            raise ValueError("No active project context")
+        logger.info(f"Successfully loaded {len(self.project_pool)} projects into pool.")
         
-        creds = self.get_credentials()
-        aiplatform.init(
-            project=config["project_id"],
-            location=config["region"],
-            credentials=creds
-        )
-        logger.info(f"Vertex AI initialized for {config['project_id']} in {config['region']}")
+        # Ensure Bucket Exists
+        if self.project_pool and settings.BUCKET_NAME:
+            p = self.project_pool[0]
+            self._ensure_bucket_exists(settings.BUCKET_NAME, p["project_id"], p["credentials"], settings.REGION)
 
-    def reload_context(self):
-        """强制刷新上下文 (切换项目时调用)"""
-        logger.info("Reloading configuration context...")
-        self._active_project = None
-        self._storage_client = None
-        
-        self.apply_proxy_settings()
+    def _ensure_bucket_exists(self, bucket_name, project_id, credentials, location):
+        """Ensure GCS Bucket exists."""
         try:
-            self.init_aiplatform()
+            storage_client = storage.Client(credentials=credentials, project=project_id)
+            bucket = storage_client.bucket(bucket_name)
+            if not bucket.exists():
+                logger.info(f"Bucket {bucket_name} not found. Creating in {location}...")
+                bucket.create(location=location)
+                logger.info(f"Bucket {bucket_name} created successfully.")
+            else:
+                logger.info(f"Bucket {bucket_name} already exists.")
         except Exception as e:
-            logger.error(f"Failed to initialize Vertex AI during reload: {e}")
+            logger.warning(f"Failed to ensure bucket {bucket_name} exists: {e}")
 
-# 单例导出
+    def get_random_project(self) -> Optional[Dict]:
+        if not self.project_pool:
+            return None
+        return random.choice(self.project_pool)
+
+    def get_storage_client(self, project_id: Optional[str] = None) -> storage.Client:
+        if not self.project_pool:
+            raise RuntimeError("No active projects loaded, cannot create storage client.")
+
+        target_project = self.get_project_by_id(project_id) if project_id else self.project_pool[0]
+        if not target_project:
+            raise RuntimeError(f"Project {project_id} not found, cannot create storage client.")
+
+        target_project_id = target_project["project_id"]
+        cached_client = self._storage_clients.get(target_project_id)
+        if cached_client:
+            return cached_client
+
+        client = storage.Client(
+            credentials=target_project["credentials"],
+            project=target_project_id,
+        )
+        self._storage_clients[target_project_id] = client
+        return client
+
+    def get_project_by_id(self, project_id: Optional[str]) -> Optional[Dict]:
+        return self.project_map.get(project_id)
+
 config_manager = ConfigManager()

@@ -1,21 +1,18 @@
 import json
 import logging
 from config.manager import config_manager
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 class GCSHandler:
     def __init__(self):
-        # 客户端由 ConfigManager 管理
         pass
 
     def _get_bucket(self):
-        active_project = config_manager.get_active_project()
-        if not active_project:
-            raise ValueError("No active project configured.")
-        
+        # Allow any available credentials to access the shared bucket
         client = config_manager.get_storage_client()
-        return client.bucket(active_project['bucket_name'])
+        return client.bucket(settings.BUCKET_NAME)
 
     def upload_jsonl(self, data: list, destination_blob_name: str) -> str:
         """上传 JSONL 并返回 gs:// URI"""
@@ -39,16 +36,16 @@ class GCSHandler:
         # 注意：prefix 必须以 / 结尾，例如 "uuid/stage_1/output/"
         try:
             bucket = self._get_bucket()
-            blobs = list(bucket.list_blobs(prefix=prefix))
             results = []
             
-            for blob in blobs:
+            for blob in bucket.list_blobs(prefix=prefix):
                 if blob.name.endswith(".jsonl") and "prediction-" in blob.name:
                     try:
                         content = blob.download_as_text()
-                        for line in content.strip().split('\n'):
-                            if line:
-                                results.append(json.loads(line))
+                        for line in content.splitlines():
+                            payload = line.strip()
+                            if payload:
+                                results.append(json.loads(payload))
                     except Exception as e:
                         logger.error(f"Failed to parse blob {blob.name}: {e}")
             
@@ -57,3 +54,4 @@ class GCSHandler:
         except Exception as e:
             logger.error(f"GCS Read Failed: {e}")
             return []
+

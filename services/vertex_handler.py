@@ -1,54 +1,212 @@
 from google.cloud import aiplatform
-from config.manager import config_manager
 import logging
 import time
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 class VertexHandler:
-    def __init__(self):
-        # 初始化移交给了 ConfigManager
-        pass
+    def __init__(self, project_context: Optional[Dict[str, Any]] = None):
+        """
+        :param project_context: Dict containing 'project_id', 'credentials', 'region'
+        """
+        self.context = project_context
 
-    def submit_job(self, job_name: str, input_uri: str, output_prefix: str) -> str:
-        """提交 Batch Prediction Job"""
-        active_project = config_manager.get_active_project()
-        if not active_project:
-            raise ValueError("No active project configured. Please set one in Admin Panel.")
+    def _require_context(self) -> Dict[str, Any]:
+        if self.context is None:
+            raise ValueError("VertexHandler requires a project_context to operate.")
+        return self.context
 
-        # 确保当前线程/进程的 SDK 已初始化
-        config_manager.init_aiplatform()
+    def _init_client(self):
+        context = self._require_context()
+        
+        aiplatform.init(
+            project=context['project_id'],
+            location=context['region'],
+            credentials=context['credentials']
+        )
 
+    def submit_job(self, job_name: str, model_id: str, input_uri: str, output_prefix: str) -> str:
+        self._init_client()
+        context = self._require_context()
+        
+        # Check bucket name for destination (handled by Dispatcher constructing the prefix, 
+        # but here we need to ensure the prefix is full gs:// URI)
+        # The caller (Dispatcher) passes fully qualified URIs? 
+        # Old code: f"gs://{active_project['bucket_name']}/{output_prefix}"
+        # We should let caller handle bucket name or pass it in context.
+        # But wait, Dispatcher knows the bucket name.
+        
         try:
             job = aiplatform.BatchPredictionJob.create(
                 job_display_name=job_name,
-                model_name="publishers/google/models/gemini-3-flash-preview", # 这里可以考虑从 Config 读取模型
+                model_name=model_id,
                 instances_format="jsonl",
                 gcs_source=[input_uri],
                 predictions_format="jsonl",
-                gcs_destination_prefix=f"gs://{active_project['bucket_name']}/{output_prefix}",
+                gcs_destination_prefix=output_prefix, # Expecting gs://...
                 sync=False,
-                project=active_project['project_id'],
-                location=active_project['region']
             )
-            
-            # WORKAROUND: with sync=False, the SDK might not populate resource_name immediately
-            time.sleep(5)
-            
-            logger.info(f"Submitted Vertex Job: {job.resource_name}")
-            return job.resource_name
+
+            resource_name = getattr(job, "resource_name", None) or getattr(job, "name", None)
+            if not resource_name:
+                for _ in range(6):
+                    time.sleep(0.5)
+                    resource_name = getattr(job, "resource_name", None) or getattr(job, "name", None)
+                    if resource_name:
+                        break
+
+            if not resource_name:
+                raise RuntimeError("Vertex job created, but resource name is unavailable")
+
+            logger.info(f"Submitted Vertex Job: {resource_name} in {context['project_id']}")
+            return resource_name
         except Exception as e:
-            logger.error(f"Vertex Submit Failed: {e}")
+            logger.error(f"Vertex Submit Failed on {context['project_id']}: {e}")
             raise
 
     def get_job_status(self, job_resource_name: str) -> str:
-        """获取任务状态"""
+        self._init_client()
+        context = self._require_context()
         try:
-            # 确保初始化
-            config_manager.init_aiplatform()
-            
-            job = aiplatform.BatchPredictionJob(job_resource_name)
+            job = aiplatform.BatchPredictionJob(
+                job_resource_name,
+                project=context['project_id'],
+                location=context['region'],
+                credentials=context['credentials'],
+            )
             return job.state.name
         except Exception as e:
-            logger.error(f"Vertex Status Check Failed: {e}")
+            # If 403 or 404, it might be the wrong project or job deleted
+            logger.error(f"Vertex Status Check Failed ({job_resource_name}): {e}")
             return "UNKNOWN"
+
+    def chat_completion(self, model_id: str, prompt: str, 
+                        sys_prompt: Optional[str] = None, 
+                        temperature: Optional[float] = 0.7,
+                        top_p: Optional[float] = 0.95,
+                        top_k: Optional[int] = 40,
+                        thinking_level: Optional[str] = None,
+                        use_search: bool = True) -> dict:
+        """
+        Real-time Chat via Direct REST API (v1beta1)
+        Matches user's exact payload structure.
+        """
+        import requests
+        from google.auth.transport.requests import Request
+
+        try:
+            context = self._require_context()
+
+            creds = context['credentials']
+            if not creds.valid:
+                creds.refresh(Request())
+            
+            access_token = creds.token
+            project_id = context['project_id']
+            region = context['region']
+            
+            # Host logic
+            if region == "global":
+                base_host = "aiplatform.googleapis.com"
+            else:
+                base_host = f"{region}-aiplatform.googleapis.com"
+
+            # URL construction
+            # MODEL_ID in settings should be just "gemini-3-flash-preview" (stripped of path)
+            url = f"https://{base_host}/v1beta1/projects/{project_id}/locations/{region}/publishers/google/models/{model_id}:generateContent"
+
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            # 1. generationConfig
+            gen_config = {
+                "temperature": 0.7 if temperature is None else temperature,
+                "topP": 0.95 if top_p is None else top_p,
+                "topK": 40 if top_k is None else top_k,
+            }
+            
+            if thinking_level:
+                gen_config["thinkingConfig"] = {
+                    "thinkingLevel": thinking_level.upper()
+                }
+
+            payload = {
+                "contents": [{
+                    "role": "user",
+                    "parts": [{"text": prompt}]
+                }],
+                "generationConfig": gen_config
+            }
+            
+            # 2. System Prompt
+            if sys_prompt:
+                payload["systemInstruction"] = {
+                    "parts": [{"text": sys_prompt}]
+                }
+
+            # 3. Google Search
+            if use_search:
+                payload["tools"] = [{
+                    "googleSearch": {} 
+                }]
+
+            # requests respects env vars for proxy
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            
+            if response.status_code != 200:
+                 logger.error(f"Google API Error {response.status_code}: {response.text}")
+                 raise Exception(f"Google API Error: {response.text}")
+            
+            result = response.json()
+            
+            # Parse result matching user's script
+            try:
+                candidates = result.get("candidates", [])
+                if not candidates:
+                     return {"answer": "Error: No candidates returned", "sources": []}
+                
+                candidate = candidates[0]
+                
+                # Safety/Finish Reason
+                if "content" not in candidate:
+                    finish_reason = candidate.get("finishReason", "UNKNOWN")
+                    return {"answer": f"Blocked: {finish_reason}", "sources": []}
+
+                answer_text = ""
+                if "parts" in candidate["content"]:
+                    for part in candidate["content"]["parts"]:
+                         if "text" in part:
+                             answer_text += part["text"]
+                
+                sources = []
+                if "groundingMetadata" in candidate:
+                    # Some versions use groundingChunks, others might differ. 
+                    # User script uses groundingChunks.
+                    chunks = candidate["groundingMetadata"].get("groundingChunks", [])
+                    for chunk in chunks:
+                        if "web" in chunk:
+                            sources.append({
+                                "title": chunk["web"].get("title", "网页链接"),
+                                "url": chunk["web"]["uri"]
+                            })
+                
+                return {
+                    "answer": answer_text,
+                    "sources": sources,
+                    "used_account": project_id,
+                    "region": region
+                }
+            except Exception as e:
+                 logger.error(f"Parsing Error: {e}")
+                 return {"answer": f"Parsing Failed: {str(e)}", "sources": [], "raw": str(result)}
+
+        except Exception as e:
+            project_id = "unknown"
+            if self.context is not None:
+                project_id = self.context.get("project_id", "unknown")
+            logger.error(f"Vertex Chat Failed on {project_id}: {e}")
+            raise
+
