@@ -1,29 +1,48 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Starting Deployment..."
+IMAGE_NAME="vertex-final:v2"
+CONTAINER_NAME="vertex-proxy"
+
+echo "[INFO] Starting deployment..."
 
 # 1. Update Code
-echo "📥 Pulling latest code..."
+echo "[INFO] Pulling latest code..."
 git pull origin main
 
 # 2. Build Image
-echo "📦 Building Docker Image (vertex-final:v2)..."
-docker build -t vertex-final:v2 .
+echo "[INFO] Building Docker image (${IMAGE_NAME})..."
+docker build -t "${IMAGE_NAME}" .
 
 # 3. Stop Old Container
-echo "🛑 Stopping old container..."
-docker stop vertex-proxy || true
-docker rm vertex-proxy || true
+echo "[INFO] Stopping old container..."
+docker stop "${CONTAINER_NAME}" || true
+docker rm "${CONTAINER_NAME}" || true
 
-# 4. Start New Container
-echo "▶️ Starting new container..."
-# Mount local_jobs.db to persist data
-docker run -d \
-  --name vertex-proxy \
+# 4. Ensure runtime directories exist
+mkdir -p "$(pwd)/json"
+mkdir -p "$(pwd)/data"
+
+# 5. Start New Container
+echo "[INFO] Starting new container..."
+if [ -f .env ]; then
+  docker run -d \
+  --name "${CONTAINER_NAME}" \
   -p 8000:8000 \
   --restart unless-stopped \
-  -v $(pwd)/local_jobs.db:/app/local_jobs.db \
-  vertex-final:v2
+  --env-file .env \
+  -v "$(pwd)/json:/app/json" \
+  -v "$(pwd)/data:/app/data" \
+  "${IMAGE_NAME}"
+else
+  docker run -d \
+  --name "${CONTAINER_NAME}" \
+  -p 8000:8000 \
+  --restart unless-stopped \
+  -v "$(pwd)/json:/app/json" \
+  -v "$(pwd)/data:/app/data" \
+  "${IMAGE_NAME}"
+fi
 
-echo "✅ Deployment Complete! Access Admin Panel at http://<YOUR-IP>:8000/admin"
+echo "[INFO] Deployment complete. Recent logs:"
+docker logs --tail 50 "${CONTAINER_NAME}" || true

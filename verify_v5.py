@@ -16,11 +16,11 @@ def check_proxy():
     print(f"Configured Proxy: {proxy}")
     
     if not proxy:
-        print("❌ Error: No Proxy Configured.")
+        print("[INFO] No proxy configured (direct connect).")
         return
 
     if "username:password" in proxy or "ip:port" in proxy:
-         print("❌ Error: You are using the default placeholder 'username:password@ip:port'.")
+         print("[ERROR] You are using the default placeholder 'username:password@ip:port'.")
          print("   Please restart the container with your ACTUAL proxy credentials in the -e HTTPS_PROXY command.")
          return
     
@@ -29,10 +29,10 @@ def check_proxy():
         # timeout set to 10s to fail fast if proxy is bad
         response = requests.get("https://api.ipify.org?format=json", timeout=10)
         data = response.json()
-        print(f"✅ Success! External IP: {data['ip']}")
+        print(f"[OK] External IP: {data['ip']}")
         print("(Please verify this matches your Proxy IP)")
     except Exception as e:
-        print(f"❌ Proxy Test Failed: {e}")
+        print(f"[ERROR] Proxy Test Failed: {e}")
         if "Missing dependencies for SOCKS support" in str(e):
              print("   (Ensure pysocks is installed via requirements.txt)")
 
@@ -43,11 +43,12 @@ def check_keys():
     print(f"Loaded Projects Count: {len(pool)}")
     
     if not pool:
-        print("❌ No keys loaded! Check json/ directory.")
+        print("[ERROR] No keys loaded! Check json/ directory.")
         return
 
     for p in pool:
-        print(f" - Loaded: {p['project_id']}")
+        project_id = p.get("project_id") if isinstance(p, dict) else None
+        print(f" - Loaded: {project_id}")
 
 def check_randomization():
     print("\n--- 3. Random Dispatch Verification (Simulation) ---")
@@ -60,16 +61,24 @@ def check_randomization():
     results = []
     for _ in range(20):
         proj = config_manager.get_random_project()
-        results.append(proj['project_id'])
+        if not isinstance(proj, dict):
+            continue
+        project_id = proj.get("project_id")
+        if project_id:
+            results.append(project_id)
+
+    if not results:
+        print("[WARN] No project selected during simulation.")
+        return
     
     counts = Counter(results)
     for pid, count in counts.items():
         print(f" - Project {pid}: selected {count} times")
     
     if len(counts) > 1:
-        print("✅ Randomization is working (multiple projects selected).")
+        print("[OK] Randomization is working (multiple projects selected).")
     else:
-        print("⚠️ Warning: Only one project selected (could be chance if pool is key small, or logic error).")
+        print("[WARN] Only one project selected (could be chance if pool is key small, or logic error).")
 
 if __name__ == "__main__":
     print("=== Accessing Headless Orchestrator Verification (v5) ===")

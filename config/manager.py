@@ -47,36 +47,32 @@ class ConfigManager:
             logger.info("No Proxy Configured (Direct Connect).")
 
     def load_projects(self):
-        """Scan json/{ACTIVE_KEY_GROUP} for .json key files."""
+        """Load project keys from grouped or flat json directories."""
         self.project_pool = []
         self.project_map = {}
         self._storage_clients = {}
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        # Adjust path to match docker layout or local
-        # Assuming /app/json inside docker, or ./json locally
-        key_dir = os.path.join(base_dir, "json", settings.ACTIVE_KEY_GROUP)
-        
-        logger.info(f"Scanning for keys in: {key_dir}")
-        
-        if not os.path.exists(key_dir):
-            logger.warning(f"Key directory not found: {key_dir} (This is expected during build/test if keys aren't mounted yet)")
+        json_root_dir = os.path.join(base_dir, "json")
+        key_files = self._discover_key_files(json_root_dir)
+        if not key_files:
             return
 
-        key_files = glob.glob(os.path.join(key_dir, "*.json"))
-        logger.info(f"Found {len(key_files)} key files.")
-        
         for key_path in key_files:
             try:
                 with open(key_path, 'r') as f:
                     key_data = json.load(f)
                 
-                project_id = key_data.get("project_id")
+                project_id = str(key_data.get("project_id", "")).strip()
                 if not project_id:
                     logger.warning(f"File {key_path} is missing 'project_id', skipping.")
                     continue
 
+                if project_id in self.project_map:
+                    logger.warning(f"Duplicate project_id {project_id} in {key_path}, skipping duplicate key.")
+                    continue
+
                 # Filter AI Studio Keys (gen-lang-client) as per user request
-                if "gen-lang-client" in str(project_id):
+                if "gen-lang-client" in project_id:
                     logger.info(f"Skipping AI Studio Key: {project_id}")
                     continue
                 
@@ -100,10 +96,50 @@ class ConfigManager:
 
         logger.info(f"Successfully loaded {len(self.project_pool)} projects into pool.")
         
-        # Ensure Bucket Exists
-        if self.project_pool and settings.BUCKET_NAME:
+        # Ensure Bucket Exists only when batch mode is enabled
+        if settings.BATCH_ENABLED and self.project_pool and settings.BUCKET_NAME:
             p = self.project_pool[0]
             self._ensure_bucket_exists(settings.BUCKET_NAME, p["project_id"], p["credentials"], settings.REGION)
+
+    def _discover_key_files(self, json_root_dir: str) -> List[str]:
+        active_group = (settings.ACTIVE_KEY_GROUP or "").strip()
+        key_files: List[str] = []
+
+        if not os.path.exists(json_root_dir):
+            logger.warning(
+                f"Key root directory not found: {json_root_dir}. "
+                "This is expected during build/test if keys are not mounted yet."
+            )
+            return []
+
+        if active_group.lower() in {"all", "*"}:
+            key_files.extend(glob.glob(os.path.join(json_root_dir, "*.json")))
+            key_files.extend(glob.glob(os.path.join(json_root_dir, "*", "*.json")))
+            logger.info("ACTIVE_KEY_GROUP=all, scanning both flat and grouped key layouts.")
+        else:
+            groups = [group.strip() for group in active_group.split(",") if group.strip()]
+            for group in groups:
+                grouped_dir = os.path.join(json_root_dir, group)
+                matches = glob.glob(os.path.join(grouped_dir, "*.json"))
+                if matches:
+                    logger.info(f"Found {len(matches)} key files in group {group}.")
+                key_files.extend(matches)
+
+            if not key_files:
+                fallback_files = glob.glob(os.path.join(json_root_dir, "*.json"))
+                if fallback_files:
+                    logger.warning(
+                        f"No grouped keys found for ACTIVE_KEY_GROUP={active_group}. "
+                        "Falling back to flat json/*.json layout."
+                    )
+                key_files.extend(fallback_files)
+
+        unique_files = sorted({os.path.abspath(path) for path in key_files if os.path.isfile(path)})
+        if not unique_files:
+            logger.warning(
+                f"No key files found for ACTIVE_KEY_GROUP={active_group or '<empty>'} under {json_root_dir}."
+            )
+        return unique_files
 
     def _ensure_bucket_exists(self, bucket_name, project_id, credentials, location):
         """Ensure GCS Bucket exists."""
@@ -132,7 +168,7 @@ class ConfigManager:
         if not target_project:
             raise RuntimeError(f"Project {project_id} not found, cannot create storage client.")
 
-        target_project_id = target_project["project_id"]
+        target_project_id = str(target_project["project_id"])
         cached_client = self._storage_clients.get(target_project_id)
         if cached_client:
             return cached_client
@@ -145,6 +181,8 @@ class ConfigManager:
         return client
 
     def get_project_by_id(self, project_id: Optional[str]) -> Optional[Dict]:
-        return self.project_map.get(project_id)
+        if not project_id:
+            return None
+        return self.project_map.get(str(project_id))
 
 config_manager = ConfigManager()

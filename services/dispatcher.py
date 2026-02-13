@@ -1,19 +1,49 @@
 import time
 import random
 import logging
-from typing import Dict, Any, Optional
+from threading import Lock
+from typing import Dict, Any, Optional, List
 from services.vertex_handler import VertexHandler
-from services.gcs_handler import GCSHandler
-from services.pipeline_logic import PipelineLogic
 from config.manager import config_manager
 from config.settings import settings
-from core.models import BatchJob
 
 logger = logging.getLogger("services.dispatcher")
 
 class Dispatcher:
     def __init__(self):
         self.cooldown_until = 0
+        self._chat_cursor = 0
+        self._next_allowed_ts: Dict[str, float] = {}
+        self._lock = Lock()
+
+    def _ordered_projects(self, pool: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], int]:
+        if not pool:
+            return [], 0
+
+        with self._lock:
+            start = self._chat_cursor % len(pool)
+        return pool[start:] + pool[:start], start
+
+    def _mark_chat_success(self, project_id: str, next_cursor: int) -> None:
+        min_interval = max(0.0, settings.CHAT_MIN_INTERVAL_SECONDS)
+        with self._lock:
+            self._next_allowed_ts[project_id] = time.time() + min_interval
+            self._chat_cursor = next_cursor
+
+    def _apply_project_rate_limit(self, project_id: str) -> None:
+        with self._lock:
+            next_allowed = self._next_allowed_ts.get(project_id, 0.0)
+        wait_seconds = max(0.0, next_allowed - time.time())
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    def _backoff_delay(self, attempt_index: int) -> float:
+        base = max(0.0, settings.CHAT_BACKOFF_BASE_SECONDS)
+        cap = max(base, settings.CHAT_BACKOFF_MAX_SECONDS)
+        jitter = max(0.0, settings.CHAT_BACKOFF_JITTER_SECONDS)
+
+        exponential = base * (2 ** attempt_index)
+        return min(cap, exponential + random.uniform(0.0, jitter))
 
     def submit_job(self, job_uuid: str, request_data: Dict[str, Any], db) -> Dict[str, Any]:
         """
@@ -21,6 +51,13 @@ class Dispatcher:
         1. Upload Input to GCS (Shared)
         2. Loop through Projects to Submit Vertex Job
         """
+        if not settings.BATCH_ENABLED:
+            raise Exception("Batch mode is disabled. Use /chat endpoint instead.")
+
+        from core.models import BatchJob
+        from services.gcs_handler import GCSHandler
+        from services.pipeline_logic import PipelineLogic
+
         job = db.query(BatchJob).filter(BatchJob.id == job_uuid).first()
         if not job:
             raise ValueError(f"Job {job_uuid} not found in DB")
@@ -133,30 +170,40 @@ class Dispatcher:
         pool = config_manager.project_pool.copy()
         if not pool:
             raise Exception("No active projects loaded.")
-        
-        random.shuffle(pool)
-        
-        last_error = ""
-        for project_ctx in pool:
-            project_id = project_ctx["project_id"]
-            try:
-                # logger.info(f"Chat routed to {project_id}") # Optional: Too noisy for chat?
-                vertex = VertexHandler(project_ctx)
-                return vertex.chat_completion(
-                    model_id=model_id,
-                    prompt=prompt,
-                    sys_prompt=sys_prompt,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    thinking_level=thinking_level,
-                    use_search=use_search,
-                )
 
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"Chat failed on {project_id}: {last_error}")
-                # Continue
+        ordered_pool, start_cursor = self._ordered_projects(pool)
+        retries = max(1, settings.CHAT_RETRY_PER_PROJECT)
+
+        last_error = ""
+        for offset, project_ctx in enumerate(ordered_pool):
+            project_id = project_ctx["project_id"]
+            vertex = VertexHandler(project_ctx)
+
+            for attempt in range(retries):
+                try:
+                    self._apply_project_rate_limit(project_id)
+                    result = vertex.chat_completion(
+                        model_id=model_id,
+                        prompt=prompt,
+                        sys_prompt=sys_prompt,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        thinking_level=thinking_level,
+                        use_search=use_search,
+                    )
+                    next_cursor = (start_cursor + offset + 1) % len(pool)
+                    self._mark_chat_success(project_id, next_cursor)
+                    return result
+
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning(
+                        f"Chat failed on {project_id} (attempt {attempt + 1}/{retries}): {last_error}"
+                    )
+                    if attempt < retries - 1:
+                        time.sleep(self._backoff_delay(attempt))
+            # Continue to next project after local retries exhausted
         
         # All failed
         self.cooldown_until = time.time() + 60

@@ -17,6 +17,20 @@ class VertexHandler:
             raise ValueError("VertexHandler requires a project_context to operate.")
         return self.context
 
+    @staticmethod
+    def _build_chat_model_path(model_id: str) -> str:
+        normalized = model_id.strip()
+        if not normalized:
+            raise ValueError("model_id cannot be empty")
+
+        if normalized.startswith("projects/"):
+            return normalized
+        if normalized.startswith("publishers/"):
+            return normalized
+        if normalized.startswith("models/"):
+            return f"publishers/google/{normalized}"
+        return f"publishers/google/models/{normalized}"
+
     def _init_client(self):
         context = self._require_context()
         
@@ -113,8 +127,8 @@ class VertexHandler:
                 base_host = f"{region}-aiplatform.googleapis.com"
 
             # URL construction
-            # MODEL_ID in settings should be just "gemini-3-flash-preview" (stripped of path)
-            url = f"https://{base_host}/v1beta1/projects/{project_id}/locations/{region}/publishers/google/models/{model_id}:generateContent"
+            model_path = self._build_chat_model_path(model_id)
+            url = f"https://{base_host}/v1beta1/projects/{project_id}/locations/{region}/{model_path}:generateContent"
 
             headers = {
                 "Authorization": f"Bearer {access_token}",

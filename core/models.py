@@ -1,9 +1,30 @@
+import os
+import logging
 from sqlalchemy import Column, String, Integer, DateTime, Text, create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from datetime import datetime
 from config.settings import settings
 
 Base = declarative_base()
+logger = logging.getLogger(__name__)
+
+
+def _prepare_sqlite_directory(database_url: str) -> None:
+    if not database_url.startswith("sqlite:///"):
+        return
+
+    sqlite_path = database_url.replace("sqlite:///", "", 1)
+    if not sqlite_path or sqlite_path == ":memory:":
+        return
+
+    db_dir = os.path.dirname(sqlite_path)
+    if not db_dir:
+        return
+
+    try:
+        os.makedirs(db_dir, exist_ok=True)
+    except OSError as exc:
+        logger.warning(f"Failed to prepare sqlite directory {db_dir}: {exc}")
 
 class BatchJob(Base):
     __tablename__ = "batch_jobs"
@@ -32,6 +53,7 @@ class BatchJob(Base):
         return f"<BatchJob(id={self.id}, status={self.status}, project={self.used_project_id})>"
 
 # DB Init
+_prepare_sqlite_directory(settings.DATABASE_URL)
 engine = create_engine(
     settings.DATABASE_URL, 
     connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
